@@ -69,7 +69,7 @@ class Filter:
             description="Add 'Open preview' button to messages with files"
         )
         PREVIEW_BUTTON_TEXT: str = Field(
-            default="Open preview",
+            default="🖥️ Open preview",
             description="Text for the preview button"
         )
         ENABLE_PREVIEW_ARTIFACT: bool = Field(
@@ -484,6 +484,188 @@ Do not attempt to edit, create, or delete files in these directories. If You nee
 </filesystem_configuration>
 """
 
-This is the full system prompt text that gets injected. As you can see it's a comprehensive guide for the AI to handle file operations, skills, computer use, etc.
+        # NOTE: File information is injected into user messages, NOT system prompt
+        # This prevents breaking prompt cache when new files are uploaded
 
-Now I need the computer_link_filter.py file which I already have. Let me include it.
+        if not messages:
+            return body
+
+        # Fix empty user messages with files attached
+        # Try both sources: body['files'] and metadata['files']
+        body_files = body.get("files", [])
+        all_files = metadata_files or body_files
+
+        if all_files:
+            # Extract filenames WITH timestamps
+            files_with_timestamps = []
+            for file_obj in all_files:
+                if isinstance(file_obj, dict):
+                    file_info = file_obj.get("file", {})
+                    filename = file_info.get("filename") or file_info.get("name")
+                    created_at = file_info.get("created_at", 0)
+                    if filename:
+                        files_with_timestamps.append({
+                            "filename": filename,
+                            "created_at": created_at
+                        })
+
+            # SMART FILTERING: Inject only NEWEST file(s) based on created_at timestamp
+            # Why: OpenWebUI doesn't save our content modifications, so we can't track mentions
+            # Solution: Assume user uploads files sequentially, inject only most recent ones
+
+            new_files = []
+
+            if len(messages) <= 2:
+                # First interaction - inject ALL files
+                new_files = [f["filename"] for f in files_with_timestamps]
+            else:
+                # Find the NEWEST file(s) uploaded (highest created_at timestamp)
+                if files_with_timestamps:
+                    # Sort by created_at descending
+                    sorted_files = sorted(files_with_timestamps, key=lambda x: x["created_at"], reverse=True)
+                    max_timestamp = sorted_files[0]["created_at"]
+
+                    # Get all files with the MAX timestamp (in case multiple uploaded at once)
+                    newest_files = [f for f in sorted_files if f["created_at"] == max_timestamp]
+
+                    # Calculate file age
+                    import time
+                    current_time = int(time.time())
+                    file_age_seconds = current_time - max_timestamp
+
+                    # HEURISTIC: Inject newest file ONLY if:
+                    # - This is message #3,4 (first few interactions) OR
+                    # - File was uploaded very recently (<60 seconds)
+                    if len(messages) <= 4:
+                        # Early in conversation - inject newest files
+                        new_files = [f["filename"] for f in newest_files]
+                    elif file_age_seconds < 60:
+                        # Recent upload - inject
+                        new_files = [f["filename"] for f in newest_files]
+                    else:
+                        pass
+
+            # IMPORTANT: If last user message is EMPTY and we have files, MUST inject something
+            # Otherwise we get "text content blocks must be non-empty" error
+            if not new_files and files_with_timestamps:
+                # Check if last user message is empty
+                last_user_idx = None
+                for idx in range(len(messages) - 1, -1, -1):
+                    if messages[idx].get("role") == "user":
+                        last_user_idx = idx
+                        break
+
+                if last_user_idx is not None:
+                    content = messages[last_user_idx].get("content", "")
+                    is_empty = isinstance(content, str) and (not content or content.strip() == "")
+
+                    if is_empty:
+                        # Last message is empty - inject NEWEST file to prevent error
+                        sorted_files = sorted(files_with_timestamps, key=lambda x: x["created_at"], reverse=True)
+                        new_files = [sorted_files[0]["filename"]]
+
+            # Add filenames to last user message
+            if new_files:
+                # Find the last user message
+                last_user_idx = None
+                for idx in range(len(messages) - 1, -1, -1):
+                    if messages[idx].get("role") == "user":
+                        last_user_idx = idx
+                        break
+
+                if last_user_idx is not None:
+                    msg = messages[last_user_idx]
+                    content = msg.get("content", "")
+
+                    if isinstance(content, str) and (not content or content.strip() == ""):
+                        # Empty user message - inject NEW filenames only
+                        files_text = "📎 " + ", ".join(new_files)
+                        msg["content"] = files_text
+                    elif isinstance(content, list):
+                        # Array content - find empty text blocks
+                        for item in content:
+                            if isinstance(item, dict) and item.get("type") == "text":
+                                text = item.get("text", "")
+                                if not text or text.strip() == "":
+                                    files_text = "📎 " + ", ".join(new_files)
+                                    item["text"] = files_text
+                                    break
+
+        # Find system message
+        system_msg_idx = None
+        for idx, msg in enumerate(messages):
+            if msg.get("role") == "system":
+                system_msg_idx = idx
+                break
+
+        if system_msg_idx is not None:
+            # Append to existing system message
+            messages[system_msg_idx]["content"] += "\n\n" + system_prompt
+        else:
+            # Insert new system message at the beginning
+            messages.insert(0, {
+                "role": "system",
+                "content": system_prompt
+            })
+
+        body["messages"] = messages
+        return body
+
+    def outlet(
+        self,
+        body: dict,
+        __user__: Optional[dict] = None,
+        __metadata__: Optional[dict] = None,
+    ) -> dict:
+        """
+        Process messages after model generation.
+        Adds preview/archive links and optional preview artifact if file links are present.
+        """
+        if (
+            not self.valves.ENABLE_ARCHIVE_BUTTON
+            and not self.valves.ENABLE_PREVIEW_BUTTON
+            and not self.valves.ENABLE_PREVIEW_ARTIFACT
+        ):
+            return body
+
+        chat_id = __metadata__.get("chat_id") if __metadata__ else None
+        if not chat_id:
+            return body
+
+        # Pattern to find file server links
+        file_url_pattern = re.escape(self.valves.FILE_SERVER_URL) + r'/files/[^/]+/[^\s\)]+'
+
+        messages = body.get("messages", [])
+
+        # Process messages array - add archive button if file links found
+        for message in messages:
+            content = message.get("content")
+            if content and isinstance(content, str):
+                # Check if content has file server links
+                if re.search(file_url_pattern, content):
+                    preview_url = f"{self.valves.FILE_SERVER_URL}/preview/{chat_id}"
+                    archive_url = f"{self.valves.FILE_SERVER_URL}/files/{chat_id}/archive"
+                    links_to_add = []
+
+                    if self.valves.ENABLE_PREVIEW_BUTTON and preview_url not in content:
+                        links_to_add.append(f"[{self.valves.PREVIEW_BUTTON_TEXT}]({preview_url})")
+
+                    if self.valves.ENABLE_ARCHIVE_BUTTON and archive_url not in content:
+                        links_to_add.append(f"[{self.valves.ARCHIVE_BUTTON_TEXT}]({archive_url})")
+
+                    artifact_to_add = ""
+                    if self.valves.ENABLE_PREVIEW_ARTIFACT:
+                        iframe_snippet = f'<iframe src="{preview_url}" style="width:100%;height:100%;border:none" allow="clipboard-write; keyboard-map"></iframe>'
+                        # Avoid duplicating the same artifact iframe across retries/edits
+                        if iframe_snippet not in content:
+                            artifact_to_add = "\n\n```html\n" + iframe_snippet + "\n```"
+
+                    if links_to_add:
+                        content = content + "\n\n---\n" + "\n".join(links_to_add)
+
+                    if artifact_to_add:
+                        content = content + artifact_to_add
+
+                    message["content"] = content
+
+        return body
