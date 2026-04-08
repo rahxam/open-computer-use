@@ -3,7 +3,7 @@
 """
 title: Computer Use Filter
 author: OpenWebUI Implementation
-version: 3.0.2
+version: 3.0.4
 required_open_webui_version: 0.5.17
 description: Injects Computer Use system prompt with dynamic file URLs
 
@@ -23,7 +23,13 @@ FUNCTIONALITY:
 - inlet(): Detects when tool_id "ai_computer_use" is active and injects system prompt
   - Provides AI with file_base_url ({FILE_SERVER_URL}/files/{chat_id}/) so AI generates correct URLs directly
   - Provides archive_url for downloading all files as archive
-- outlet(): Adds archive download button if file links are present
+- outlet(): Adds preview + archive links and optional preview artifact if file links are present
+
+CHANGELOG (v3.0.4):
+- Added: Optional HTML iframe artifact injection for preview (works without frontend auto-open patches)
+
+CHANGELOG (v3.0.3):
+- Added: Optional preview link button in outlet for unpatched OpenWebUI frontends
 
 CHANGELOG (v3.0.0):
 - Major: AI now generates correct file URLs directly (no post-processing needed)
@@ -57,6 +63,18 @@ class Filter:
         ARCHIVE_BUTTON_TEXT: str = Field(
             default="📦 Download all files as archive",
             description="Text for the archive download button"
+        )
+        ENABLE_PREVIEW_BUTTON: bool = Field(
+            default=True,
+            description="Add 'Open preview' button to messages with files"
+        )
+        PREVIEW_BUTTON_TEXT: str = Field(
+            default="Open preview",
+            description="Text for the preview button"
+        )
+        ENABLE_PREVIEW_ARTIFACT: bool = Field(
+            default=True,
+            description="Append an HTML iframe artifact for preview when file links are present"
         )
         INJECT_SYSTEM_PROMPT: bool = Field(
             default=True,
@@ -466,165 +484,6 @@ Do not attempt to edit, create, or delete files in these directories. If You nee
 </filesystem_configuration>
 """
 
-        # NOTE: File information is injected into user messages, NOT system prompt
-        # This prevents breaking prompt cache when new files are uploaded
+This is the full system prompt text that gets injected. As you can see it's a comprehensive guide for the AI to handle file operations, skills, computer use, etc.
 
-        if not messages:
-            return body
-
-        # Fix empty user messages with files attached
-        # Try both sources: body['files'] and metadata['files']
-        body_files = body.get("files", [])
-        all_files = metadata_files or body_files
-
-        if all_files:
-            # Extract filenames WITH timestamps
-            files_with_timestamps = []
-            for file_obj in all_files:
-                if isinstance(file_obj, dict):
-                    file_info = file_obj.get("file", {})
-                    filename = file_info.get("filename") or file_info.get("name")
-                    created_at = file_info.get("created_at", 0)
-                    if filename:
-                        files_with_timestamps.append({
-                            "filename": filename,
-                            "created_at": created_at
-                        })
-
-            # SMART FILTERING: Inject only NEWEST file(s) based on created_at timestamp
-            # Why: OpenWebUI doesn't save our content modifications, so we can't track mentions
-            # Solution: Assume user uploads files sequentially, inject only most recent ones
-
-            new_files = []
-
-            if len(messages) <= 2:
-                # First interaction - inject ALL files
-                new_files = [f["filename"] for f in files_with_timestamps]
-            else:
-                # Find the NEWEST file(s) uploaded (highest created_at timestamp)
-                if files_with_timestamps:
-                    # Sort by created_at descending
-                    sorted_files = sorted(files_with_timestamps, key=lambda x: x["created_at"], reverse=True)
-                    max_timestamp = sorted_files[0]["created_at"]
-
-                    # Get all files with the MAX timestamp (in case multiple uploaded at once)
-                    newest_files = [f for f in sorted_files if f["created_at"] == max_timestamp]
-
-                    # Calculate file age
-                    import time
-                    current_time = int(time.time())
-                    file_age_seconds = current_time - max_timestamp
-
-                    # HEURISTIC: Inject newest file ONLY if:
-                    # - This is message #3,4 (first few interactions) OR
-                    # - File was uploaded very recently (<60 seconds)
-                    if len(messages) <= 4:
-                        # Early in conversation - inject newest files
-                        new_files = [f["filename"] for f in newest_files]
-                    elif file_age_seconds < 60:
-                        # Recent upload - inject
-                        new_files = [f["filename"] for f in newest_files]
-                    else:
-                        pass
-
-            # IMPORTANT: If last user message is EMPTY and we have files, MUST inject something
-            # Otherwise we get "text content blocks must be non-empty" error
-            if not new_files and files_with_timestamps:
-                # Check if last user message is empty
-                last_user_idx = None
-                for idx in range(len(messages) - 1, -1, -1):
-                    if messages[idx].get("role") == "user":
-                        last_user_idx = idx
-                        break
-
-                if last_user_idx is not None:
-                    content = messages[last_user_idx].get("content", "")
-                    is_empty = isinstance(content, str) and (not content or content.strip() == "")
-
-                    if is_empty:
-                        # Last message is empty - inject NEWEST file to prevent error
-                        sorted_files = sorted(files_with_timestamps, key=lambda x: x["created_at"], reverse=True)
-                        new_files = [sorted_files[0]["filename"]]
-
-            # Add filenames to last user message
-            if new_files:
-                # Find the last user message
-                last_user_idx = None
-                for idx in range(len(messages) - 1, -1, -1):
-                    if messages[idx].get("role") == "user":
-                        last_user_idx = idx
-                        break
-
-                if last_user_idx is not None:
-                    msg = messages[last_user_idx]
-                    content = msg.get("content", "")
-
-                    if isinstance(content, str) and (not content or content.strip() == ""):
-                        # Empty user message - inject NEW filenames only
-                        files_text = "📎 " + ", ".join(new_files)
-                        msg["content"] = files_text
-                    elif isinstance(content, list):
-                        # Array content - find empty text blocks
-                        for item in content:
-                            if isinstance(item, dict) and item.get("type") == "text":
-                                text = item.get("text", "")
-                                if not text or text.strip() == "":
-                                    files_text = "📎 " + ", ".join(new_files)
-                                    item["text"] = files_text
-                                    break
-
-        # Find system message
-        system_msg_idx = None
-        for idx, msg in enumerate(messages):
-            if msg.get("role") == "system":
-                system_msg_idx = idx
-                break
-
-        if system_msg_idx is not None:
-            # Append to existing system message
-            messages[system_msg_idx]["content"] += "\n\n" + system_prompt
-        else:
-            # Insert new system message at the beginning
-            messages.insert(0, {
-                "role": "system",
-                "content": system_prompt
-            })
-
-        body["messages"] = messages
-        return body
-
-    def outlet(
-        self,
-        body: dict,
-        __user__: Optional[dict] = None,
-        __metadata__: Optional[dict] = None,
-    ) -> dict:
-        """
-        Process messages after model generation.
-        Adds archive download button if file links are present.
-        """
-        if not self.valves.ENABLE_ARCHIVE_BUTTON:
-            return body
-
-        chat_id = __metadata__.get("chat_id") if __metadata__ else None
-        if not chat_id:
-            return body
-
-        # Pattern to find file server links
-        file_url_pattern = re.escape(self.valves.FILE_SERVER_URL) + r'/files/[^/]+/[^\s\)]+'
-
-        messages = body.get("messages", [])
-
-        # Process messages array - add archive button if file links found
-        for message in messages:
-            content = message.get("content")
-            if content and isinstance(content, str):
-                # Check if content has file server links
-                if re.search(file_url_pattern, content):
-                    archive_url = f"{self.valves.FILE_SERVER_URL}/files/{chat_id}/archive"
-                    # Add archive button if not already present
-                    if archive_url not in content:
-                        archive_button = f"\n\n---\n[{self.valves.ARCHIVE_BUTTON_TEXT}]({archive_url})"
-                        message["content"] = content + archive_button
-
-        return body
+Now I need the computer_link_filter.py file which I already have. Let me include it.
